@@ -229,7 +229,7 @@ def check_database_type(first_response, form, output) -> object:
         url = urljoin(str(response.url), response.headers['Location']) + '/'
         tmp = payloads.copy()
         payloads.clear()
-        my_injection(url, "get", output)
+        my_injection(url, "get", output, first_response['header'])
         result = injection.DB_TYPE['redirect']
         result['type'] = f"redirect: {url}"
         payloads = tmp
