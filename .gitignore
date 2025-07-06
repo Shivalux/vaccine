@@ -1,0 +1,6 @@
+*.DS_Store
+venv
+./vaccine/dvwa-sql-injection
+*defualt_one.txt
+*__pycache__
+*.txt

